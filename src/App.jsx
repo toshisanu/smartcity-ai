@@ -7,7 +7,7 @@ import {
   Popup,
   Rectangle
 } from "react-leaflet";
-import { Icon, divIcon } from "leaflet";
+import { Icon, divIcon, point } from "leaflet";
 import { FaMicrophone } from "react-icons/fa";
 
 import { auth, provider, db } from "./lib/firebase";
@@ -35,20 +35,22 @@ const userIcon = new Icon({
 
 // иконка-лейбл (DivIcon) для подписи внутри прямоугольника
 function makeLabelIcon(text, color) {
+  const safeText = String(text || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const html = `<div style="
       font-size:12px;
-      padding:4px 6px;
-      border-radius:6px;
-      background: rgba(255,255,255,0.9);
+      padding:4px 8px;
+      border-radius:8px;
+      background: rgba(255,255,255,0.92);
       color:${color};
-      box-shadow:0 1px 4px rgba(0,0,0,0.15);
+      box-shadow:0 2px 6px rgba(0,0,0,0.12);
       border: 1px solid rgba(0,0,0,0.06);
       white-space:nowrap;
       font-weight:600;
-    ">${text}</div>`;
+    ">${safeText}</div>`;
   return divIcon({
     html,
     className: "scai-rect-label",
+    iconSize: point(0, 0),
     iconAnchor: [0, 0],
     popupAnchor: [0, -10]
   });
@@ -74,7 +76,7 @@ function computeDangerLevel(text) {
 
   const weights = {
     "дтп": 10,
-    "авари": 10,
+    "авари": 10,        // авария, аварии, аварию и т.д.
     "столкнов": 10,
     "пожар": 10,
     "взрыв": 10,
@@ -113,7 +115,7 @@ function computeDangerLevel(text) {
     }
   }
 
-  if (/\b(очень|срочно|немедленно|критично|опасно|срочно)\b/.test(t)) {
+  if (/\b(очень|срочно|немедленно|критично|опасно)\b/.test(t)) {
     score += 3;
     matches.push({ stem: "urgency_booster", weight: 3, method: "booster" });
   }
@@ -151,10 +153,6 @@ function App() {
     }
   });
 
-  // weather / city state
-  const [city, setCity] = useState(null);
-  const [weather, setWeather] = useState(null); // {temp, desc, humidity, visibility, raw}
-
   // функция для скрытия инструкций (с запоминанием)
   const hideInstructions = () => {
     try { localStorage.setItem("scai_instructions_shown", "1"); } catch {}
@@ -171,16 +169,13 @@ function App() {
   // референс карты, чтобы центрировать
   const mapRef = useRef(null);
 
-  // геопозиция
+  // геопозиция (только ставим метку пользователя)
   useEffect(() => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
-        async (pos) => {
+        (pos) => {
           const latlon = [pos.coords.latitude, pos.coords.longitude];
           setLocation(latlon);
-
-          // после получения юзераной позиции — получить город и погоду
-          await getCityAndWeather(latlon[0], latlon[1]);
         },
         (err) => console.error("Ошибка геолокации:", err),
         { enableHighAccuracy: true }
@@ -188,7 +183,7 @@ function App() {
     }
   }, []);
 
-  // когда локация обновилась вручную — центрируем карту
+  // центрируем карту при смене location
   useEffect(() => {
     if (location && mapRef.current && typeof mapRef.current.setView === "function") {
       try {
@@ -229,7 +224,6 @@ function App() {
           const data = d.data();
           const created = data.createdAt ?? Date.now();
           const createdAt = typeof created === "number" ? created : (created?.toMillis ? created.toMillis() : Date.now());
-          // reason: respect saved reason if any, else empty (we may append predicted reason later)
           return {
             id: d.id,
             text: data.text || "",
@@ -279,90 +273,7 @@ function App() {
     }
   };
 
-  // reverse geocode (возвращает address и city если возможно)
-  async function reverseGeocode(lat, lon) {
-    try {
-      const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`;
-      const res = await fetch(url, { headers: { "User-Agent": "SmartCityAI/1.0" } });
-      if (!res.ok) return { display: `${lat.toFixed(5)}, ${lon.toFixed(5)}`, city: null };
-      const j = await res.json();
-      const road = j.address?.road || j.address?.pedestrian || j.address?.footway || "";
-      const house = j.address?.house_number ? ` ${j.address.house_number}` : "";
-      const city = j.address?.city || j.address?.town || j.address?.village || j.address?.county || null;
-      const display = road ? road + house + (city ? `, ${city}` : "") : (j.display_name || `${lat.toFixed(5)}, ${lon.toFixed(5)}`);
-      return { display, city };
-    } catch (e) {
-      console.warn("Reverse geocode failed:", e);
-      return { display: `${lat.toFixed(5)}, ${lon.toFixed(5)}`, city: null };
-    }
-  }
-
-  // Получить погоду (OpenWeatherMap) по координатам и вычислить прогноз риска (гололед/туман)
-  async function getCityAndWeather(lat, lon) {
-    // try to detect city via nominatim
-    const rg = await reverseGeocode(lat, lon);
-    setCity(rg.city || rg.display || null);
-
-    // get weather: prefer OpenWeatherMap
-    const key = import.meta.env.VITE_OPENWEATHER_API_KEY;
-    if (!key) {
-      // fallback mock
-      const mock = { temp: 17, desc: "ясно", humidity: 40, visibility: 10000, raw: null };
-      setWeather(mock);
-      return mock;
-    }
-
-    try {
-      const url = `https://api.openweathermap.org/data/2.5/weather?lat=${lat}&lon=${lon}&units=metric&lang=ru&appid=${key}`;
-      const r = await fetch(url);
-      if (!r.ok) {
-        console.warn("OpenWeather fetch failed", await r.text());
-        setWeather({ temp: 17, desc: "ясно", humidity: 40, visibility: 10000, raw: null });
-        return null;
-      }
-      const j = await r.json();
-      const temp = j.main?.temp ?? null;
-      const desc = j.weather && j.weather.length ? j.weather[0].description : (j.weather?.description || "");
-      const humidity = j.main?.humidity ?? null;
-      const visibility = j.visibility ?? 10000;
-      const raw = j;
-      const w = { temp, desc, humidity, visibility, raw };
-      setWeather(w);
-      return w;
-    } catch (e) {
-      console.warn("Weather fetch error:", e);
-      setWeather({ temp: 17, desc: "ясно", humidity: 40, visibility: 10000, raw: null });
-      return null;
-    }
-  }
-
-  // given weather, return predicted reason string (or null)
-  function predictWeatherReason(w) {
-    if (!w) return null;
-    const temp = typeof w.temp === "number" ? w.temp : parseFloat(w.temp);
-    const humidity = w.humidity ?? 0;
-    const vis = w.visibility ?? 10000;
-    const main = (w.raw?.weather && w.raw.weather[0]?.main) ? w.raw.weather[0].main.toLowerCase() : (w.desc || "").toLowerCase();
-
-    // fog: low visibility or weather code 7xx
-    if (vis < 1000 || /\b(mist|fog|haze|дым|туман)\b/i.test(w.desc || "") || (w.raw?.weather && (w.raw.weather[0].id >= 700 && w.raw.weather[0].id < 800))) {
-      return "туман (прогноз)";
-    }
-
-    // ice: temp at or below 0 with precipitation/humidity or mention of freezing/drizzle/snow
-    if (temp !== null && temp <= 0 && (humidity >= 75 || /\b(rain|drizzle|snow|sleet|freez)/i.test(JSON.stringify(w.raw?.weather || "")) )) {
-      return "гололёд (прогноз)";
-    }
-
-    // slippery/icy possibility: temp slightly above 0 but high humidity + earlier precipitation
-    if (temp !== null && temp <= 3 && humidity >= 85) {
-      return "вероятен гололёд (прогноз)";
-    }
-
-    return null;
-  }
-
-  // голосовой ассистент: подсказки + фиксация
+  // голосовой ассистент: подсказки + фиксация (без погоды)
   const startListening = () => {
     const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
     if (!SpeechRecognition) {
@@ -391,6 +302,7 @@ function App() {
         return;
       }
 
+      // команда фиксации (слово "зафиксируй")
       if (text.includes("зафиксируй")) {
         const after = text.split("зафиксируй").pop().trim();
         const description = after || "инцидент";
@@ -401,29 +313,35 @@ function App() {
         }
 
         const [lat, lon] = location;
-        const rg = await reverseGeocode(lat, lon);
-        const address = rg.display;
-        // recompute weather just-in-case
-        const w = await getCityAndWeather(lat, lon);
-        const predicted = predictWeatherReason(w);
+        // без погоды: определяем только address через reverseGeocode (если нужно) — но чтобы не менять логику сильно, используем stored address via reverseGeocode inline:
+        let address = `${lat.toFixed(5)}, ${lon.toFixed(5)}`;
+        try {
+          const url = `https://nominatim.openstreetmap.org/reverse?format=json&lat=${lat}&lon=${lon}`;
+          const r = await fetch(url, { headers: { "User-Agent": "SmartCityAI/1.0" } });
+          if (r.ok) {
+            const j = await r.json();
+            const road = j.address?.road || j.address?.pedestrian || j.address?.footway || "";
+            const house = j.address?.house_number ? ` ${j.address.house_number}` : "";
+            const city = j.address?.city || j.address?.town || j.address?.village || "";
+            address = road ? road + house + (city ? `, ${city}` : "") : (j.display_name || address);
+          }
+        } catch (e) {
+          console.warn("Reverse geocode failed:", e);
+        }
+
         const danger = computeDangerLevel(description);
 
-        // reason priority:
-        // 1) If user said a specific cause (contains лед/туман/авария/дтп...), use that as reason.
-        // 2) else if predicted by weather, use predicted reason.
-        // 3) else null.
+        // reason priority: explicit mention in description -> stored reason else null
         let explicitReason = null;
-        if (/\b(лед|гололед|гололёд|гололед|туман|авар|дтп|столкнов|пожар)\b/i.test(description)) {
-          explicitReason = description.match(/\b(лед|гололед|гололёд|туман|авар|дтп|столкнов|пожар)\b/i)[0];
-        }
-        const reason = explicitReason ? explicitReason : (predicted ? predicted : null);
+        const explicitRe = description.match(/\b(лед|гололед|гололёд|туман|авар|авария|дтп|столкнов|пожар)\b/i);
+        if (explicitRe) explicitReason = explicitRe[0];
 
         const payloadForDb = {
           text: description,
           coords: [lat, lon],
           danger,
           address,
-          reason,
+          reason: explicitReason || null,
           createdAt: Date.now()
         };
 
@@ -436,7 +354,7 @@ function App() {
             localStorage.setItem("hazards", JSON.stringify(next));
             return next;
           });
-          alert(`Зафиксировано: ${description}\nАдрес: ${address}\nУровень: ${danger === "high" ? "высокий" : danger === "medium" ? "средний" : "низкий"}${reason ? `\nПричина: ${reason}` : ""}`);
+          alert(`Зафиксировано: ${description}\nАдрес: ${address}\nУровень: ${danger === "high" ? "высокий" : danger === "medium" ? "средний" : "низкий"}${explicitReason ? `\nПричина: ${explicitReason}` : ""}`);
         } catch (e) {
           console.error("Ошибка сохранения в Firestore:", e);
           const id = "local-" + Date.now();
@@ -451,6 +369,7 @@ function App() {
         return;
       }
 
+      // fallback подсказка
       alert(
         "Команда не распознана.\n" +
         "Скажи: «Ассистент, зафиксируй инцидент [описание]»\n" +
@@ -552,7 +471,6 @@ function App() {
             </div>
 
             <div className="flex items-center gap-3">
-              <div className="hidden sm:block text-sm text-slate-500">Мониторинг инцидентов в реальном времени{city ? ` — ${city}` : ""}{weather ? ` • ${Math.round(weather.temp)}°C, ${weather.desc}` : ""}</div>
               <div>
                 {user ? (
                   <div className="flex items-center gap-2">
@@ -600,17 +518,11 @@ function App() {
 
       <div className="w-full max-w-6xl px-4 mt-4">
         <div className="flex justify-between items-center mb-3">
-          <div className="text-sm text-slate-600">
-            {user ? <>👤 <span className="font-medium">{user.displayName || user.email}</span></> : <>Не вошли</>}
-          </div>
+          {/* оставляем только кнопку удаления всех меток для админа (профиль/вход уже в шапке) */}
+          <div></div>
           <div className="flex gap-2 items-center">
             {isAdmin && (
               <button onClick={handleDeleteAll} className="px-3 py-2 bg-red-600 text-white rounded-md shadow">🗑 Удалить все метки</button>
-            )}
-            {!user ? (
-              <button onClick={handleSignIn} className="px-4 py-2 bg-gradient-to-r from-emerald-500 to-teal-400 text-white rounded-md shadow">Войти через Google</button>
-            ) : (
-              <button onClick={handleSignOut} className="px-3 py-2 bg-white border rounded-md">Выйти</button>
             )}
           </div>
         </div>
@@ -642,8 +554,6 @@ function App() {
                   <Popup>
                     <div className="text-sm">
                       <div className="font-medium">Вы здесь</div>
-                      {city && <div className="text-xs text-slate-500">Город: {city}</div>}
-                      {weather && <div className="text-xs text-slate-500">Погода: {Math.round(weather.temp)}°C, {weather.desc}</div>}
                     </div>
                   </Popup>
                 </Marker>
@@ -662,10 +572,10 @@ function App() {
                 ];
                 const style = getOverlayStyle(h.danger);
 
-                // determine visible reason: prefer explicit reason, else infer from text, else predicted from weather
-                const predicted = predictWeatherReason(weather);
-                const explicitReason = h.reason || (/\b(лед|гололед|гололёд|туман|авар|дтп|столкнов|пожар)\b/i.test(h.text) ? (h.text.match(/\b(лед|гололед|гололёд|туман|авар|дтп|столкнов|пожар)\b/i)||[null])[0] : null);
-                const reason = explicitReason || predicted || null;
+                // determine visible reason: prefer explicit reason stored in DB or inferred from text
+                const explicitRe = (h.text || "").match(/\b(лед|гололед|гололёд|туман|авар|авария|дтп|столкнов|пожар)\b/i);
+                const explicitReason = h.reason || (explicitRe ? explicitRe[0] : null);
+                const reason = explicitReason || null;
 
                 // label color based on danger
                 const labelColor = h.danger === "high" ? "#b91c1c" : h.danger === "medium" ? "#b45309" : "#0f766e";
