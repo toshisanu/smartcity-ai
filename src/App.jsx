@@ -7,7 +7,7 @@ import {
   Popup,
   Rectangle
 } from "react-leaflet";
-import { Icon, divIcon } from "leaflet";
+import { Icon, divIcon, point } from "leaflet";
 import { FaMicrophone } from "react-icons/fa";
 
 import { auth, provider, db } from "./lib/firebase";
@@ -35,20 +35,22 @@ const userIcon = new Icon({
 
 // иконка-лейбл (DivIcon) для подписи внутри прямоугольника
 function makeLabelIcon(text, color) {
+  const safeText = String(text || "").replace(/</g, "&lt;").replace(/>/g, "&gt;");
   const html = `<div style="
       font-size:12px;
-      padding:4px 6px;
-      border-radius:6px;
-      background: rgba(255,255,255,0.9);
+      padding:4px 8px;
+      border-radius:8px;
+      background: rgba(255,255,255,0.92);
       color:${color};
-      box-shadow:0 1px 4px rgba(0,0,0,0.15);
+      box-shadow:0 2px 6px rgba(0,0,0,0.12);
       border: 1px solid rgba(0,0,0,0.06);
       white-space:nowrap;
       font-weight:600;
-    ">${text}</div>`;
+    ">${safeText}</div>`;
   return divIcon({
     html,
     className: "scai-rect-label",
+    iconSize: point(0, 0),
     iconAnchor: [0, 0],
     popupAnchor: [0, -10]
   });
@@ -74,7 +76,7 @@ function computeDangerLevel(text) {
 
   const weights = {
     "дтп": 10,
-    "авари": 10,
+    "авари": 10,        // авария, аварии, аварию и т.д.
     "столкнов": 10,
     "пожар": 10,
     "взрыв": 10,
@@ -113,7 +115,7 @@ function computeDangerLevel(text) {
     }
   }
 
-  if (/\b(очень|срочно|немедленно|критично|опасно|срочно)\b/.test(t)) {
+  if (/\b(очень|срочно|немедленно|критично|опасно)\b/.test(t)) {
     score += 3;
     matches.push({ stem: "urgency_booster", weight: 3, method: "booster" });
   }
@@ -171,15 +173,14 @@ function App() {
   // референс карты, чтобы центрировать
   const mapRef = useRef(null);
 
-  // геопозиция
+  // геопозиция + сразу получить город/погоду
   useEffect(() => {
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
         async (pos) => {
           const latlon = [pos.coords.latitude, pos.coords.longitude];
           setLocation(latlon);
-
-          // после получения юзераной позиции — получить город и погоду
+          // после получения позиции — получить город и погоду
           await getCityAndWeather(latlon[0], latlon[1]);
         },
         (err) => console.error("Ошибка геолокации:", err),
@@ -188,7 +189,7 @@ function App() {
     }
   }, []);
 
-  // когда локация обновилась вручную — центрируем карту
+  // центрируем карту при смене location
   useEffect(() => {
     if (location && mapRef.current && typeof mapRef.current.setView === "function") {
       try {
@@ -229,7 +230,6 @@ function App() {
           const data = d.data();
           const created = data.createdAt ?? Date.now();
           const createdAt = typeof created === "number" ? created : (created?.toMillis ? created.toMillis() : Date.now());
-          // reason: respect saved reason if any, else empty (we may append predicted reason later)
           return {
             id: d.id,
             text: data.text || "",
@@ -342,10 +342,9 @@ function App() {
     const temp = typeof w.temp === "number" ? w.temp : parseFloat(w.temp);
     const humidity = w.humidity ?? 0;
     const vis = w.visibility ?? 10000;
-    const main = (w.raw?.weather && w.raw.weather[0]?.main) ? w.raw.weather[0].main.toLowerCase() : (w.desc || "").toLowerCase();
 
-    // fog: low visibility or weather code 7xx
-    if (vis < 1000 || /\b(mist|fog|haze|дым|туман)\b/i.test(w.desc || "") || (w.raw?.weather && (w.raw.weather[0].id >= 700 && w.raw.weather[0].id < 800))) {
+    // fog: low visibility or weather codes 7xx
+    if (vis < 1000 || /\b(mist|fog|haze|дым|туман)\b/i.test(w.desc || "") || (w.raw?.weather && (w.raw.weather[0]?.id >= 700 && w.raw.weather[0]?.id < 800))) {
       return "туман (прогноз)";
     }
 
@@ -354,7 +353,7 @@ function App() {
       return "гололёд (прогноз)";
     }
 
-    // slippery/icy possibility: temp slightly above 0 but high humidity + earlier precipitation
+    // slippery/icy possibility: temp slightly above 0 but high humidity
     if (temp !== null && temp <= 3 && humidity >= 85) {
       return "вероятен гололёд (прогноз)";
     }
@@ -391,6 +390,7 @@ function App() {
         return;
       }
 
+      // команда фиксации (слово "зафиксируй")
       if (text.includes("зафиксируй")) {
         const after = text.split("зафиксируй").pop().trim();
         const description = after || "инцидент";
@@ -403,19 +403,18 @@ function App() {
         const [lat, lon] = location;
         const rg = await reverseGeocode(lat, lon);
         const address = rg.display;
-        // recompute weather just-in-case
+        // обновим погоду на случай смены
         const w = await getCityAndWeather(lat, lon);
         const predicted = predictWeatherReason(w);
         const danger = computeDangerLevel(description);
 
         // reason priority:
-        // 1) If user said a specific cause (contains лед/туман/авария/дтп...), use that as reason.
-        // 2) else if predicted by weather, use predicted reason.
-        // 3) else null.
+        // 1) если пользователь явно упомянул причину (лед, туман, авария и т.д.) — используем её
+        // 2) иначе используем предсказанную по погоде
         let explicitReason = null;
-        if (/\b(лед|гололед|гололёд|гололед|туман|авар|дтп|столкнов|пожар)\b/i.test(description)) {
-          explicitReason = description.match(/\b(лед|гололед|гололёд|туман|авар|дтп|столкнов|пожар)\b/i)[0];
-        }
+        const explicitRe = description.match(/\b(лед|гололед|гололёд|туман|авар|авария|дтп|столкнов|пожар)\b/i);
+        if (explicitRe) explicitReason = explicitRe[0];
+
         const reason = explicitReason ? explicitReason : (predicted ? predicted : null);
 
         const payloadForDb = {
@@ -451,6 +450,7 @@ function App() {
         return;
       }
 
+      // fallback подсказка
       alert(
         "Команда не распознана.\n" +
         "Скажи: «Ассистент, зафиксируй инцидент [описание]»\n" +
@@ -552,7 +552,34 @@ function App() {
             </div>
 
             <div className="flex items-center gap-3">
-              <div className="hidden sm:block text-sm text-slate-500">Мониторинг инцидентов в реальном времени{city ? ` — ${city}` : ""}{weather ? ` • ${Math.round(weather.temp)}°C, ${weather.desc}` : ""}</div>
+                {/* --- Информация о городе и погоде (заменяет прежнюю одну строку) --- */}
+                <div className="hidden sm:block text-sm text-slate-500 mr-4">
+                  <div>
+                    <span className="text-xs text-slate-400">Ваш город:</span>{" "}
+                    <span className="font-medium text-slate-700">
+                      {city || "не определён"}
+                    </span>
+                  </div>
+
+                  <div className="mt-0.5">
+                    <span className="text-xs text-slate-400">Погодные условия:</span>{" "}
+                    <span className="font-medium text-slate-700">
+                      {weather
+                        ? `${(weather.desc || "").charAt(0).toUpperCase() + (weather.desc || "").slice(1)}, ${Math.round(weather.temp)}°C`
+                        : "загрузка..."}
+                    </span>
+                  </div>
+
+                  {/* возможные осложнения (если функция predictWeatherReason возвращает что-то) */}
+                  {weather && (() => {
+                    const comp = predictWeatherReason(weather);
+                    return comp ? (
+                      <div className="mt-0.5 text-xs" style={{ color: "#b45309" /* amber */ }}>
+                        Возможные осложнения: <span className="font-semibold">{comp}</span>
+                      </div>
+                    ) : null;
+                  })()}
+                </div>
               <div>
                 {user ? (
                   <div className="flex items-center gap-2">
@@ -664,7 +691,8 @@ function App() {
 
                 // determine visible reason: prefer explicit reason, else infer from text, else predicted from weather
                 const predicted = predictWeatherReason(weather);
-                const explicitReason = h.reason || (/\b(лед|гололед|гололёд|туман|авар|дтп|столкнов|пожар)\b/i.test(h.text) ? (h.text.match(/\b(лед|гололед|гололёд|туман|авар|дтп|столкнов|пожар)\b/i)||[null])[0] : null);
+                const explicitRe = (h.text || "").match(/\b(лед|гололед|гололёд|туман|авар|авария|дтп|столкнов|пожар)\b/i);
+                const explicitReason = h.reason || (explicitRe ? explicitRe[0] : null);
                 const reason = explicitReason || predicted || null;
 
                 // label color based on danger
